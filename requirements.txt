@@ -1,0 +1,15 @@
+# Core dependencies (required)
+requests
+beautifulsoup4
+
+# Optional: Domain age checking
+python-whois
+
+# Optional: Attachment text extraction
+pdfplumber
+python-docx
+
+# Optional: Image/QR/OCR scanning
+pillow
+pyzbar
+pytesseract

@@ -2,9 +2,9 @@
 
 **Author:** EclipseManic  
 
-A Python-based phishing email analyzer that inspects `.eml` files for malicious indicators.  
-It integrates with **VirusTotal** and leverages multiple detection techniques, including header analysis, domain reputation, link inspection, and attachment scanning.  
+Advance Phishing Mail Detector is a powerful, Python-based tool designed to analyze .eml files and detect phishing attempts with a high degree of accuracy. By integrating with the VirusTotal API and employing a multi-faceted analysis approach, this tool can identify a wide range of malicious indicators in emails. From detailed header analysis to in-depth content scanning, this tool provides a comprehensive defense against phishing threats.
 
+This tool is perfect for security enthusiasts, researchers, and anyone looking to better understand the anatomy of a phishing email. It provides a clear and actionable verdict, helping you to quickly determine if an email is SAFE, CAUTIOUS, or UNSAFE.
 ---
 
 ## 🚀 Features

@@ -38,15 +38,14 @@ except ImportError:
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
-# FIX: Reverted to the more standard environment variable method for the API key.
+# VirusTotal API key (optional). If absent, VirusTotal reputation/link/file scans will be skipped
 API_KEY = os.getenv("VT_API_KEY")
-if not API_KEY:
-    raise RuntimeError("VirusTotal API key not found. Please set the VT_API_KEY environment variable.")
+VT_AVAILABLE = bool(API_KEY)
 
 CONFIG = {
     "weights": {
-        "mismatch_return_path": 2, "mismatch_reply_to": 2, "dmarc_fail": 10,
-        "dmarc_other_fail": 3, "spf_fail": 2, "spf_not_found": 1, "dkim_fail": 2,
+        "mismatch_return_path": 2, "mismatch_reply_to": 2, "dmarc_fail": 7,
+        "dmarc_other_fail": 2, "spf_fail": 2, "spf_not_found": 1, "dkim_fail": 2,
         "dkim_not_found": 1, "homograph_attack": 5, "malicious_link": 3,
         "malicious_domain": 4, "malicious_ip": 3, "urgent_keywords": 1,
         "high_risk_keywords": 4, "abused_service_link": 2, "recent_domain": 5,
@@ -80,28 +79,46 @@ def parse_eml_file(file_path):
         try:
             # Backwards-compatible attachment detection:
             # Prefer get_content_disposition() when available, fall back to filename or application/* types.
+            # Determine disposition/attachment more defensively
             is_attachment = False
             try:
-                if hasattr(part, 'get_content_disposition') and part.get_content_disposition() == 'attachment':
+                disp = None
+                if hasattr(part, 'get_content_disposition'):
+                    disp = part.get_content_disposition()
+                filename = part.get_filename()
+                ctype = part.get_content_type() or ''
+                if disp == 'attachment' or filename:
                     is_attachment = True
-                elif part.get_filename():
+                elif ctype.startswith('application/'):
                     is_attachment = True
-                else:
-                    ctype = part.get_content_type() or ''
-                    # Treat most application/* parts as attachments (e.g., PDFs, executables)
-                    if ctype.startswith('application/'):
-                        is_attachment = True
             except Exception:
                 is_attachment = False
 
+            payload = part.get_payload(decode=True)
+            # Attachments: store raw bytes if present; ensure filename exists
             if is_attachment:
-                attachments.append({'filename': part.get_filename(), 'data': part.get_payload(decode=True)})
-            elif part.get_content_type().startswith("image/"):
-                images.append(part.get_payload(decode=True))
-            elif part.get_content_type() == 'text/plain':
-                body += part.get_payload(decode=True).decode(errors='ignore')
-            elif part.get_content_type() == 'text/html':
-                html_body += part.get_payload(decode=True).decode(errors='ignore')
+                attachments.append({'filename': (part.get_filename() or 'unknown'), 'data': payload})
+            elif ctype.startswith('image/'):
+                if payload:
+                    images.append(payload)
+            elif ctype == 'text/plain':
+                if isinstance(payload, bytes):
+                    charset = part.get_content_charset() or 'utf-8'
+                    try:
+                        body += payload.decode(charset, errors='ignore')
+                    except Exception:
+                        body += payload.decode(errors='ignore')
+                elif isinstance(payload, str):
+                    body += payload
+            elif ctype == 'text/html':
+                if isinstance(payload, bytes):
+                    charset = part.get_content_charset() or 'utf-8'
+                    try:
+                        html_body += payload.decode(charset, errors='ignore')
+                    except Exception:
+                        html_body += payload.decode(errors='ignore')
+                elif isinstance(payload, str):
+                    html_body += payload
         except Exception as e:
             print(f"{YELLOW}Warning: Could not process a part of the email. Error: {e}{RESET}")
     return header_text, body, html_body, attachments, images
@@ -119,16 +136,32 @@ def analyze_header(header_text):
     findings['Return-Path Mismatch'] = (findings['From Address'] and findings['Return-Path Address'] and findings['Return-Path Address'] != findings['From Address'])
     findings['Reply-To Mismatch'] = (findings['From Address'] and findings['Reply-To Address'] and findings['Reply-To Address'] != findings['From Address'])
 
-    auth_results = re.search(r"Authentication-Results:.*", header_text, re.IGNORECASE | re.DOTALL)
-    if auth_results:
-        res = auth_results.group(0)
-        for auth in ['SPF', 'DKIM', 'DMARC']:
-            match = re.search(fr"{auth.lower()}=(\w+)", res, re.IGNORECASE)
-            findings[f'{auth} Result'] = match.group(1).lower() if match else "Not Found"
-    else:
-        match = re.search(r"Received-SPF: (\w+)", header_text, re.IGNORECASE)
-        findings['SPF Result'] = match.group(1).lower() if match else "Not Found"
-        findings['DKIM Result'], findings['DMARC Result'] = "Not Found", "Not Found"
+    # Use a more robust parser for Authentication-Results which can be folded across lines
+    def parse_auth_results(hdr_text):
+        out = {'spf': 'not found', 'dkim': 'not found', 'dmarc': 'not found'}
+        try:
+            # collect all Authentication-Results header instances (account for folded lines)
+            matches = re.findall(r"Authentication-Results:[^\n]*(?:\n[ \t].*)*", hdr_text, re.IGNORECASE)
+            if matches:
+                joined = ' '.join(m.replace('\n', ' ') for m in matches)
+                for key in ['spf', 'dkim', 'dmarc']:
+                    m = re.search(fr"{key}\s*=\s*([A-Za-z0-9_-]+)", joined, re.IGNORECASE)
+                    if m:
+                        val = m.group(1).lower()
+                        # normalize some variants
+                        if val in ['temperror', 'timeout']:
+                            val = 'neutral'
+                        elif val in ['permerror']:
+                            val = 'fail'
+                        out[key] = val
+        except Exception:
+            pass
+        return out
+
+    auth = parse_auth_results(header_text)
+    findings['SPF Result'] = auth.get('spf', 'not found')
+    findings['DKIM Result'] = auth.get('dkim', 'not found')
+    findings['DMARC Result'] = auth.get('dmarc', 'not found')
     return findings
 
 def analyze_domain_for_spoofing(domain):
@@ -229,7 +262,7 @@ def unshorten_url(url):
 
 
 # -------------------------------
-# CORE LOGIC FUNCTIONS
+# CORE LOGIC FUNCTIONSz
 # -------------------------------
 def generate_score_and_feedback(data):
     score, feedback_items = 0, []
@@ -239,9 +272,14 @@ def generate_score_and_feedback(data):
         score += w['mismatch_return_path']
         feedback_items.append(f"{RED}{CROSS} Return-Path Mismatch:{RESET} A technique sometimes used for spoofing.")
     
-    if data['header_findings'].get('DMARC Result') == 'fail':
-        score = w['dmarc_fail']
+    dmarc_res = data['header_findings'].get('DMARC Result')
+    if dmarc_res == 'fail':
+        score += w['dmarc_fail']
         feedback_items.append(f"{RED}{CROSS} DMARC Failure:{RESET} Critical sign that the sender is forged.")
+    elif dmarc_res in ['none', 'not found', 'neutral']:
+        # DMARC present but not passing (or not present) — smaller penalty
+        score += w['dmarc_other_fail']
+        feedback_items.append(f"{YELLOW}{INFO} DMARC Not Pass:{RESET} DMARC not evaluated as 'pass' (value: {dmarc_res}).")
     
     for auth in ['SPF', 'DKIM']:
         res = data['header_findings'].get(f'{auth} Result')
@@ -332,9 +370,19 @@ def main():
     for auth in ['SPF', 'DKIM', 'DMARC']:
         val = findings.get(f'{auth} Result')
         print(f"{BOLD}{BLUE}{auth} Result:{RESET} ", end='')
-        if val == 'pass': print(f"{GREEN}{CHECK} Pass{RESET}")
-        elif val == 'not found': print(f"{YELLOW}{INFO} Not Found{RESET}")
-        else: print(f"{RED}{CROSS} {val.capitalize()} (Failed){RESET}")
+        if val == 'pass':
+            print(f"{GREEN}{CHECK} Pass{RESET}")
+        elif val in ['not found', 'none', 'neutral']:
+            # 'none' is not necessarily a hard failure — it often means the domain's DMARC policy is set to 'none'
+            # or that the message didn't meet alignment (no enforcement). Show as informational.
+            if val == 'not found':
+                print(f"{YELLOW}{INFO} Not Found{RESET}")
+            elif val == 'none':
+                print(f"{YELLOW}{INFO} None: DMARC policy is 'none' or alignment not met (no enforcement){RESET}")
+            else:
+                print(f"{YELLOW}{INFO} {val.capitalize()}{RESET}")
+        else:
+            print(f"{RED}{CROSS} {val.capitalize()} (Failed){RESET}")
 
     domain_age = check_domain_age(sender_domain) if sender_domain else None
     if domain_age is not None:
